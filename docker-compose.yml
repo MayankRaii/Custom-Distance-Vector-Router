@@ -1,0 +1,70 @@
+version: "3.8"
+
+networks:
+  net_ab:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.1.0/24
+          gateway: 10.0.1.254
+
+  net_bc:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.2.0/24
+          gateway: 10.0.2.254
+
+  net_ac:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.3.0/24
+          gateway: 10.0.3.254
+
+services:
+
+  # Router A
+  router_a:
+    build: .
+    container_name: router_a
+    privileged: true          # required for 'ip route' kernel writes
+    networks:
+      net_ab:
+        ipv4_address: 10.0.1.1
+      net_ac:
+        ipv4_address: 10.0.3.1
+    environment:
+      - MY_IP=10.0.1.1
+      # Router B is reachable on net_ab; Router C is reachable on net_ac
+      - NEIGHBORS=10.0.1.2,10.0.3.2
+
+  # Router B
+  router_b:
+    build: .
+    container_name: router_b
+    privileged: true
+    networks:
+      net_ab:
+        ipv4_address: 10.0.1.2
+      net_bc:
+        ipv4_address: 10.0.2.1
+    environment:
+      - MY_IP=10.0.1.2
+      # Router A is reachable on net_ab; Router C is reachable on net_bc
+      - NEIGHBORS=10.0.1.1,10.0.2.2
+
+  # Router C
+  router_c:
+    build: .
+    container_name: router_c
+    privileged: true
+    networks:
+      net_bc:
+        ipv4_address: 10.0.2.2
+      net_ac:
+        ipv4_address: 10.0.3.2
+    environment:
+      - MY_IP=10.0.2.2
+      # Router B is reachable on net_bc; Router A is reachable on net_ac
+      - NEIGHBORS=10.0.2.1,10.0.3.1
