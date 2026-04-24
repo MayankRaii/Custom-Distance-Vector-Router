@@ -6,14 +6,15 @@ import os
 import subprocess
 import ipaddress
 import re
+from typing import Optional
 
 MY_IP      = os.getenv("MY_IP", "127.0.0.1")
 NEIGHBORS  = [n.strip() for n in os.getenv("NEIGHBORS", "").split(",") if n.strip()]
 PORT       = 5000
 
-UPDATE_INTERVAL  = 5    # seconds between broadcasts
-ROUTE_TIMEOUT    = 15   # seconds before an unrefreshed route is expired
-INFINITY         = 16   # RIP-style infinity (max hop count)
+UPDATE_INTERVAL  = 3    
+ROUTE_TIMEOUT    = 12   
+INFINITY         = 16   
 
 routing_table: dict = {}
 routing_lock  = threading.Lock()
@@ -50,16 +51,65 @@ def initialize_routing_table():
     print(f"[INIT] Routing table initialised with {len(subnets)} local subnet(s): {subnets}")
     print_routing_table()
 
+def _sync_local_subnets_unlocked() -> bool:
+    """
+    Re-read 'ip addr' and align self routes with current interfaces. When
+    Docker detaches a network, the kernel drops the on-link route but we must
+    drop the stale *self* entry or Bellman–Ford will never re-learn the prefix
+    and neighbors may keep a dead path that split horizon hides from you.
+    """
+    now = time.time()
+    new_local = set(get_local_subnets())
+    changed = False
+    for subnet, info in list(routing_table.items()):
+        if info.get("source") == "self" and subnet not in new_local:
+            del routing_table[subnet]
+            changed = True
+            print(f"[LOCAL] Interface gone for {subnet} — removed self route")
+    for subnet in new_local:
+        ex = routing_table.get(subnet)
+        if ex is None:
+            routing_table[subnet] = {
+                "distance": 0,
+                "next_hop": "0.0.0.0",
+                "source":   "self",
+                "updated":  now,
+            }
+            changed = True
+            print(f"[LOCAL] New on-link subnet {subnet}")
+        elif ex.get("source") != "self":
+            if ex["distance"] < INFINITY and ex.get("next_hop") and ex.get("next_hop") != "0.0.0.0":
+                _del_kernel_route(subnet, str(ex.get("next_hop")))
+            routing_table[subnet] = {
+                "distance": 0,
+                "next_hop": "0.0.0.0",
+                "source":   "self",
+                "updated":  now,
+            }
+            changed = True
+            print(f"[LOCAL] Reconnected on-link: {subnet}")
+    return changed
+
+def sync_local_subnets() -> bool:
+    with routing_lock:
+        return _sync_local_subnets_unlocked()
+
 def build_packet_for(neighbor_ip: str) -> bytes:
     """
-    Build a DV-JSON packet applying Split Horizon:
-    Do NOT advertise a route back to the neighbour it was learned from.
+    Split horizon with poisoned reverse: for neighbour N, if N is the first
+    hop to a destination, still send that prefix with metric INFINITY (RIP-style
+    16) instead of omitting. That gives peers explicit refresh + invalidation of
+    loop/obsolete paths, while not locking stale routes (omit + global liveness).
     """
     with routing_lock:
         routes = []
         for subnet, info in routing_table.items():
-            # Split Horizon: skip routes learned from this exact neighbour
-            if info["source"] == neighbor_ip:
+            if info.get("source") == "self":
+                routes.append({"subnet": subnet, "distance": 0})
+                continue
+            if str(info.get("next_hop")) == str(neighbor_ip):
+                if info["distance"] < INFINITY:
+                    routes.append({"subnet": subnet, "distance": INFINITY})
                 continue
             if info["distance"] < INFINITY:
                 routes.append({"subnet": subnet, "distance": info["distance"]})
@@ -77,6 +127,9 @@ def broadcast_updates():
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
     while True:
+        ch = sync_local_subnets()
+        if ch:
+            print_routing_table()
         for neighbor in NEIGHBORS:
             try:
                 data = build_packet_for(neighbor)
@@ -98,8 +151,6 @@ def listen_for_updates():
         try:
             data, addr = sock.recvfrom(65535)
             packet = json.loads(data.decode())
-            # Use the real source IP as next-hop (addr[0]) so it is
-            # always reachable on the same subnet as us.
             neighbor_ip = addr[0]
             routes      = packet.get("routes", [])
             print(f"[RX] {len(routes)} route(s) from {neighbor_ip}")
@@ -115,15 +166,16 @@ def listen_for_updates():
 def update_logic(neighbor_ip: str, routes_from_neighbor: list):
     """
     Bellman-Ford:   new_cost = advertised_cost + link_cost (link_cost = 1)
-
-    Split Horizon is enforced on the TX side (build_packet_for).
-    Here we also handle route withdrawal: if a neighbour re-advertises
-    a route it previously taught us but with cost >= INFINITY, we remove it.
+    We only accept direct neighbours in NEIGHBORS.  Poisoned reverse in
+    build_packet_for ensures every hop still gets explicit per-prefix updates.
     """
+    if neighbor_ip not in NEIGHBORS:
+        return
     changed = False
     now     = time.time()
 
     with routing_lock:
+        local = set(get_local_subnets())
         for route in routes_from_neighbor:
             subnet            = route.get("subnet")
             received_distance = int(route.get("distance", INFINITY))
@@ -133,8 +185,31 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: list):
             new_distance = min(received_distance + 1, INFINITY)
             current      = routing_table.get(subnet)
 
+            if subnet in local and current and current.get("source") != "self":
+                nh = str(current.get("next_hop", "")) or None
+                if nh and nh != "0.0.0.0":
+                    _del_kernel_route(subnet, nh)
+                routing_table[subnet] = {
+                    "distance": 0,
+                    "next_hop": "0.0.0.0",
+                    "source":   "self",
+                    "updated":  now,
+                }
+                print(f"[BF] PREFER-LOCAL {subnet:20s}  (on-link)")
+                changed = True
+                continue
+
             if current is None:
-                # Brand-new subnet discovered
+                if subnet in local:
+                    routing_table[subnet] = {
+                        "distance": 0,
+                        "next_hop": "0.0.0.0",
+                        "source":   "self",
+                        "updated":  now,
+                    }
+                    changed = True
+                    print(f"[BF] SELF   {subnet:20s}  (on-link, repair)")
+                    continue
                 if new_distance < INFINITY:
                     routing_table[subnet] = {
                         "distance": new_distance,
@@ -147,11 +222,11 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: list):
                     changed = True
 
             elif current["distance"] == 0 and current["source"] == "self":
-                # Directly connected – never overwrite
                 pass
 
             elif new_distance < current["distance"]:
-                # Strictly better path
+                if subnet in local:
+                    continue
                 routing_table[subnet] = {
                     "distance": new_distance,
                     "next_hop": neighbor_ip,
@@ -162,15 +237,33 @@ def update_logic(neighbor_ip: str, routes_from_neighbor: list):
                 print(f"[BF] BETTER {subnet:20s}  via {neighbor_ip}  dist={new_distance}")
                 changed = True
 
+            elif (
+                not (current.get("source") == "self")
+                and new_distance == current.get("distance")
+                and new_distance < INFINITY
+                and str(neighbor_ip) != str(current.get("next_hop", ""))
+            ):
+                if subnet in local:
+                    continue
+                a = int(ipaddress.IPv4Address(neighbor_ip))
+                b = int(ipaddress.IPv4Address(str(current.get("next_hop", "0.0.0.0"))))
+                if a < b:
+                    routing_table[subnet] = {
+                        "distance":     new_distance,
+                        "next_hop":     neighbor_ip,
+                        "source":       neighbor_ip,
+                        "updated":      now,
+                    }
+                    _add_kernel_route(subnet, neighbor_ip)
+                    print(f"[BF] TIE-LOW  {subnet:20s}  via {neighbor_ip}  dist={new_distance}")
+                    changed = True
+
             elif current["source"] == neighbor_ip:
-                # Same neighbour – accept updated distance (may be worse or same)
                 current["updated"] = now
                 if new_distance != current["distance"]:
                     if new_distance >= INFINITY:
-                        # Route withdrawal / link failure
-                        _del_kernel_route(subnet)
-                        routing_table[subnet]["distance"] = INFINITY
-                        routing_table[subnet]["next_hop"] = "0.0.0.0"
+                        _del_kernel_route(subnet, str(current.get("next_hop", "")) or None)
+                        del routing_table[subnet]
                         print(f"[BF] UNREACH {subnet:20s}  (withdrawn by {neighbor_ip})")
                     else:
                         routing_table[subnet]["distance"] = new_distance
@@ -192,26 +285,42 @@ def expire_routes():
         changed = False
 
         with routing_lock:
+            if _sync_local_subnets_unlocked():
+                changed = True
             for subnet, info in list(routing_table.items()):
                 if info["source"] == "self":
                     continue
                 if info["distance"] < INFINITY and (now - info["updated"]) > ROUTE_TIMEOUT:
+                    if subnet in get_local_subnets():
+                        if info.get("source") != "self":
+                            routing_table[subnet] = {
+                                "distance": 0, "next_hop": "0.0.0.0", "source": "self", "updated": now,
+                            }
+                        changed = True
+                        continue
                     print(f"[EXPIRE] {subnet}  via {info['next_hop']} timed out")
-                    _del_kernel_route(subnet)
-                    routing_table[subnet]["distance"] = INFINITY
-                    routing_table[subnet]["next_hop"] = "0.0.0.0"
+                    _del_kernel_route(subnet, str(info.get("next_hop", "")) or None)
+                    del routing_table[subnet]
                     changed = True
 
         if changed:
             print_routing_table()
 
-def _add_kernel_route(subnet: str, via: str):
+def _add_kernel_route(subnet: str, via: str) -> None:
+    if subnet in get_local_subnets():
+        return
     ret = os.system(f"ip route replace {subnet} via {via} 2>/dev/null")
     if ret != 0:
         print(f"[KERN] Warning: could not replace route {subnet} via {via}")
 
 
-def _del_kernel_route(subnet: str):
+def _del_kernel_route(subnet: str, via: Optional[str] = None) -> None:
+    """Remove a remote (via) route; never wipe an on-link prefix the kernel owns."""
+    if via and str(via) and str(via) != "0.0.0.0":
+        os.system(f"ip route del {subnet} via {via} 2>/dev/null")
+        return
+    if subnet in get_local_subnets():
+        return
     os.system(f"ip route del {subnet} 2>/dev/null")
 
 def print_routing_table():
@@ -230,7 +339,6 @@ def print_routing_table():
 if __name__ == "__main__":
     print(f"[BOOT] Router starting  MY_IP={MY_IP}  NEIGHBORS={NEIGHBORS}")
 
-    # Give Docker a moment to finish configuring network interfaces
     time.sleep(3)
 
     initialize_routing_table()
@@ -238,5 +346,4 @@ if __name__ == "__main__":
     threading.Thread(target=broadcast_updates, daemon=True).start()
     threading.Thread(target=expire_routes,     daemon=True).start()
 
-    # Main thread blocks here receiving updates
     listen_for_updates()
